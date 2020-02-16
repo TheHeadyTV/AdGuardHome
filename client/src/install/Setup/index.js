@@ -25,7 +25,8 @@ import Footer from '../../components/ui/Footer';
 import logo from '../../components/ui/svg/logo-dark-ui.svg';
 
 import './Setup.css';
-import '../../components/ui/Tabler-Dark.css';
+import '../../components/ui/Tabler.css';
+import '../../components/ui/Tabler-DarkPatch.css';
 
 class Setup extends Component {
     componentDidMount() {
