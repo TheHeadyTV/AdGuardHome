@@ -1,7 +1,7 @@
 device_mockup.psd
 .DS_Store
 /.vscode
-/.idea
+.idea
 /AdGuardHome
 /AdGuardHome.exe
 /AdGuardHome.yaml
