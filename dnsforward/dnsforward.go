@@ -136,6 +136,8 @@ type FilteringConfig struct {
 
 	EnableEDNSClientSubnet bool `yaml:"edns_client_subnet"` // Enable EDNS Client Subnet option
 
+	EnableDNSSEC bool `yaml:"enable_dnssec"` // Set DNSSEC flag in outcoming DNS request
+
 	// Respond with an empty answer to all AAAA requests
 	AAAADisabled bool `yaml:"aaaa_disabled"`
 
@@ -147,7 +149,9 @@ type FilteringConfig struct {
 	ParentalBlockHost     string `yaml:"parental_block_host"`
 	SafeBrowsingBlockHost string `yaml:"safebrowsing_block_host"`
 
-	CacheSize   uint     `yaml:"cache_size"` // DNS cache size (in bytes)
+	CacheSize   uint32   `yaml:"cache_size"`    // DNS cache size (in bytes)
+	CacheMinTTL uint32   `yaml:"cache_ttl_min"` // override TTL value (minimum) received from upstream server
+	CacheMaxTTL uint32   `yaml:"cache_ttl_max"` // override TTL value (maximum) received from upstream server
 	UpstreamDNS []string `yaml:"upstream_dns"`
 }
 
@@ -179,6 +183,10 @@ type ServerConfig struct {
 
 	FilteringConfig
 	TLSConfig
+	TLSAllowUnencryptedDOH bool
+
+	TLSv12Roots *x509.CertPool // list of root CAs for TLSv1.2
+	TLSCiphers  []uint16       // list of TLS ciphers to use
 
 	// Called when the configuration is changed by HTTP request
 	ConfigModified func()
@@ -289,6 +297,8 @@ func (s *Server) Prepare(config *ServerConfig) error {
 		RefuseAny:                s.conf.RefuseAny,
 		CacheEnabled:             true,
 		CacheSizeBytes:           int(s.conf.CacheSize),
+		CacheMinTTL:              s.conf.CacheMinTTL,
+		CacheMaxTTL:              s.conf.CacheMaxTTL,
 		Upstreams:                s.conf.Upstreams,
 		DomainsReservedUpstreams: s.conf.DomainsReservedUpstreams,
 		BeforeRequestHandler:     s.beforeRequestHandler,
@@ -338,6 +348,8 @@ func (s *Server) Prepare(config *ServerConfig) error {
 			MinVersion:     tls.VersionTLS12,
 		}
 	}
+	upstream.RootCAs = s.conf.TLSv12Roots
+	upstream.CipherSuites = s.conf.TLSCiphers
 
 	if len(proxyConfig.Upstreams) == 0 {
 		log.Fatal("len(proxyConfig.Upstreams) == 0")
@@ -508,6 +520,7 @@ type dnsContext struct {
 	err                  error        // error returned from the module
 	protectionEnabled    bool         // filtering is enabled, dnsfilter object is ready
 	responseFromUpstream bool         // response is received from upstream servers
+	origReqDNSSEC        bool         // DNSSEC flag in the original request from user
 }
 
 const (
@@ -584,6 +597,18 @@ func processUpstream(ctx *dnsContext) int {
 		}
 	}
 
+	if s.conf.EnableDNSSEC {
+		opt := d.Req.IsEdns0()
+		if opt == nil {
+			log.Debug("DNS: Adding OPT record with DNSSEC flag")
+			d.Req.SetEdns0(4096, true)
+		} else if !opt.Do() {
+			opt.SetDo(true)
+		} else {
+			ctx.origReqDNSSEC = true
+		}
+	}
+
 	// request was not filtered so let it be processed further
 	err := s.dnsProxy.Resolve(d)
 	if err != nil {
@@ -595,6 +620,50 @@ func processUpstream(ctx *dnsContext) int {
 	return resultDone
 }
 
+// Process DNSSEC after response from upstream server
+func processDNSSECAfterResponse(ctx *dnsContext) int {
+	d := ctx.proxyCtx
+
+	if !ctx.responseFromUpstream || // don't process response if it's not from upstream servers
+		!ctx.srv.conf.EnableDNSSEC {
+		return resultDone
+	}
+
+	optResp := d.Res.IsEdns0()
+	if !ctx.origReqDNSSEC && optResp != nil && optResp.Do() {
+		return resultDone
+	}
+
+	// Remove RRSIG records from response
+	//  because there is no DO flag in the original request from client,
+	//  but we have EnableDNSSEC set, so we have set DO flag ourselves,
+	//  and now we have to clean up the DNS records our client didn't ask for.
+
+	answers := []dns.RR{}
+	for _, a := range d.Res.Answer {
+		switch a.(type) {
+		case *dns.RRSIG:
+			log.Debug("Removing RRSIG record from response: %v", a)
+		default:
+			answers = append(answers, a)
+		}
+	}
+	d.Res.Answer = answers
+
+	answers = []dns.RR{}
+	for _, a := range d.Res.Ns {
+		switch a.(type) {
+		case *dns.RRSIG:
+			log.Debug("Removing RRSIG record from response: %v", a)
+		default:
+			answers = append(answers, a)
+		}
+	}
+	d.Res.Ns = answers
+
+	return resultDone
+}
+
 // Apply filtering logic after we have received response from upstream servers
 func processFilteringAfterResponse(ctx *dnsContext) int {
 	s := ctx.srv
@@ -602,11 +671,11 @@ func processFilteringAfterResponse(ctx *dnsContext) int {
 	res := ctx.result
 	var err error
 
-	if !ctx.responseFromUpstream {
-		return resultDone // don't process response if it's not from upstream servers
-	}
-
-	if res.Reason == dnsfilter.ReasonRewrite && len(res.CanonName) != 0 {
+	switch res.Reason {
+	case dnsfilter.ReasonRewrite:
+		if len(res.CanonName) == 0 {
+			break
+		}
 		d.Req.Question[0] = ctx.origQuestion
 		d.Res.Question[0] = ctx.origQuestion
 
@@ -617,7 +686,14 @@ func processFilteringAfterResponse(ctx *dnsContext) int {
 			d.Res.Answer = answer
 		}
 
-	} else if res.Reason != dnsfilter.NotFilteredWhiteList && ctx.protectionEnabled {
+	case dnsfilter.NotFilteredWhiteList:
+		// nothing
+
+	default:
+		if !ctx.protectionEnabled || // filters are disabled: there's nothing to check for
+			!ctx.responseFromUpstream { // only check response if it's from an upstream server
+			break
+		}
 		origResp2 := d.Res
 		ctx.result, err = s.filterDNSResponse(ctx)
 		if err != nil {
@@ -684,14 +760,19 @@ func (s *Server) handleDNSRequest(p *proxy.Proxy, d *proxy.DNSContext) error {
 		processInitial,
 		processFilteringBeforeRequest,
 		processUpstream,
+		processDNSSECAfterResponse,
 		processFilteringAfterResponse,
 		processQueryLogsAndStats,
 	}
 	for _, process := range mods {
 		r := process(ctx)
 		switch r {
+		case resultDone:
+			// continue: call the next filter
+
 		case resultFinish:
 			return nil
+
 		case resultError:
 			return ctx.err
 		}
@@ -736,6 +817,10 @@ func (s *Server) updateStats(d *proxy.DNSContext, elapsed time.Duration, res dns
 	case dnsfilter.NotFilteredWhiteList:
 		fallthrough
 	case dnsfilter.NotFilteredError:
+		fallthrough
+	case dnsfilter.ReasonRewrite:
+		fallthrough
+	case dnsfilter.RewriteEtcHosts:
 		e.Result = stats.RNotFiltered
 
 	case dnsfilter.FilteredSafeBrowsing:
@@ -781,7 +866,8 @@ func (s *Server) filterDNSRequest(ctx *dnsContext) (*dnsfilter.Result, error) {
 		// log.Tracef("Host %s is filtered, reason - '%s', matched rule: '%s'", host, res.Reason, res.Rule)
 		d.Res = s.genDNSFilterMessage(d, &res)
 
-	} else if res.Reason == dnsfilter.ReasonRewrite && len(res.IPList) != 0 {
+	} else if (res.Reason == dnsfilter.ReasonRewrite || res.Reason == dnsfilter.RewriteEtcHosts) &&
+		len(res.IPList) != 0 {
 		resp := s.makeResponse(req)
 
 		name := host

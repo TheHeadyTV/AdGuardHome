@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/AdguardTeam/AdGuardHome/util"
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/cache"
 	"github.com/AdguardTeam/golibs/log"
@@ -48,6 +49,13 @@ type Config struct {
 	CacheTime             uint `yaml:"cache_time"`              // Element's TTL (in minutes)
 
 	Rewrites []RewriteEntry `yaml:"rewrites"`
+
+	// Names of services to block (globally).
+	// Per-client settings can override this configuration.
+	BlockedServices []string `yaml:"blocked_services"`
+
+	// IP-hostname pairs taken from system configuration (e.g. /etc/hosts) files
+	AutoHosts *util.AutoHosts `yaml:"-"`
 
 	// Called when the configuration is changed by HTTP request
 	ConfigModified func() `yaml:"-"`
@@ -135,6 +143,9 @@ const (
 
 	// ReasonRewrite - rewrite rule was applied
 	ReasonRewrite
+
+	// RewriteEtcHosts - rewrite by /etc/hosts rule
+	RewriteEtcHosts
 )
 
 var reasonNames = []string{
@@ -150,6 +161,7 @@ var reasonNames = []string{
 	"FilteredBlockedService",
 
 	"Rewrite",
+	"RewriteEtcHosts",
 }
 
 func (r Reason) String() string {
@@ -175,6 +187,7 @@ func (d *Dnsfilter) WriteDiskConfig(c *Config) {
 	d.confLock.Lock()
 	*c = d.Config
 	c.Rewrites = rewriteArrayDup(d.Config.Rewrites)
+	// BlockedServices
 	d.confLock.Unlock()
 }
 
@@ -296,6 +309,15 @@ func (d *Dnsfilter) CheckHost(host string, qtype uint16, setts *RequestFiltering
 	result = d.processRewrites(host)
 	if result.Reason == ReasonRewrite {
 		return result, nil
+	}
+
+	if d.Config.AutoHosts != nil {
+		ips := d.Config.AutoHosts.Process(host)
+		if ips != nil {
+			result.Reason = RewriteEtcHosts
+			result.IPList = ips
+			return result, nil
+		}
 	}
 
 	// try filter lists first
@@ -633,6 +655,18 @@ func New(c *Config, blockFilters []Filter) *Dnsfilter {
 		d.prepareRewrites()
 	}
 
+	bsvcs := []string{}
+	for _, s := range d.BlockedServices {
+		if !BlockedSvcKnown(s) {
+			log.Debug("skipping unknown blocked-service '%s'", s)
+			continue
+		}
+		bsvcs = append(bsvcs, s)
+	}
+	d.BlockedServices = bsvcs
+
+	initBlockedServices()
+
 	if blockFilters != nil {
 		err := d.initFiltering(nil, blockFilters)
 		if err != nil {
@@ -655,6 +689,7 @@ func (d *Dnsfilter) Start() {
 	if d.Config.HTTPRegister != nil { // for tests
 		d.registerSecurityHandlers()
 		d.registerRewritesHandlers()
+		d.registerBlockedServicesHandlers()
 	}
 }
 

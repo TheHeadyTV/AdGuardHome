@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -32,8 +34,6 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/querylog"
 	"github.com/AdguardTeam/AdGuardHome/stats"
 	"github.com/AdguardTeam/golibs/log"
-	"github.com/NYTimes/gziphandler"
-	"github.com/gobuffalo/packr"
 )
 
 const (
@@ -56,17 +56,19 @@ type homeContext struct {
 	// Modules
 	// --
 
-	clients     clientsContainer     // per-client-settings module
-	stats       stats.Stats          // statistics module
-	queryLog    querylog.QueryLog    // query log module
-	dnsServer   *dnsforward.Server   // DNS module
-	rdns        *RDNS                // rDNS module
-	whois       *Whois               // WHOIS module
-	dnsFilter   *dnsfilter.Dnsfilter // DNS filtering module
-	dhcpServer  *dhcpd.Server        // DHCP module
-	auth        *Auth                // HTTP authentication module
-	httpServer  *http.Server         // HTTP module
-	httpsServer HTTPSServer          // HTTPS module
+	clients    clientsContainer     // per-client-settings module
+	stats      stats.Stats          // statistics module
+	queryLog   querylog.QueryLog    // query log module
+	dnsServer  *dnsforward.Server   // DNS module
+	rdns       *RDNS                // rDNS module
+	whois      *Whois               // WHOIS module
+	dnsFilter  *dnsfilter.Dnsfilter // DNS filtering module
+	dhcpServer *dhcpd.Server        // DHCP module
+	auth       *Auth                // HTTP authentication module
+	filters    Filtering            // DNS filtering module
+	web        *Web                 // Web (HTTP, HTTPS) module
+	tls        *TLSMod              // TLS module
+	autoHosts  util.AutoHosts       // IP-hostname pairs taken from system configuration (e.g. /etc/hosts) files
 
 	// Runtime properties
 	// --
@@ -77,6 +79,8 @@ type homeContext struct {
 	pidFileName      string // PID file name.  Empty if no PID file was created.
 	disableUpdate    bool   // If set, don't check for updates
 	controlLock      sync.Mutex
+	tlsRoots         *x509.CertPool // list of root CAs for TLSv1.2
+	tlsCiphers       []uint16       // list of TLS ciphers to use
 	transport        *http.Transport
 	client           *http.Client
 	appSignalChannel chan os.Signal // Channel for receiving OS signals by the console app
@@ -112,10 +116,20 @@ func Main(version string, channel string, armVer string) {
 	Context.appSignalChannel = make(chan os.Signal)
 	signal.Notify(Context.appSignalChannel, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	go func() {
-		<-Context.appSignalChannel
-		cleanup()
-		cleanupAlways()
-		os.Exit(0)
+		for {
+			sig := <-Context.appSignalChannel
+			log.Info("Received signal '%s'", sig)
+			switch sig {
+			case syscall.SIGHUP:
+				Context.clients.Reload()
+				Context.tls.Reload()
+
+			default:
+				cleanup()
+				cleanupAlways()
+				os.Exit(0)
+			}
+		}
 	}()
 
 	// run the protection
@@ -132,15 +146,6 @@ func run(args options) {
 	} else {
 		// Default config file name
 		Context.configFilename = "AdGuardHome.yaml"
-	}
-
-	// Init some of the Context fields right away
-	Context.transport = &http.Transport{
-		DialContext: customDialContext,
-	}
-	Context.client = &http.Client{
-		Timeout:   time.Minute * 5,
-		Transport: Context.transport,
 	}
 
 	// configure working dir and config path
@@ -168,7 +173,20 @@ func run(args options) {
 	}
 
 	initConfig()
-	initServices()
+
+	Context.tlsRoots = util.LoadSystemRootCAs()
+	Context.tlsCiphers = util.InitTLSCiphers()
+	Context.transport = &http.Transport{
+		DialContext: customDialContext,
+		Proxy:       getHTTPProxy,
+		TLSClientConfig: &tls.Config{
+			RootCAs: Context.tlsRoots,
+		},
+	}
+	Context.client = &http.Client{
+		Timeout:   time.Minute * 5,
+		Transport: Context.transport,
+	}
 
 	if !Context.firstRun {
 		// Do the upgrade if necessary
@@ -195,7 +213,8 @@ func run(args options) {
 	if Context.dhcpServer == nil {
 		os.Exit(1)
 	}
-	Context.clients.Init(config.Clients, Context.dhcpServer)
+	Context.autoHosts.Init("")
+	Context.clients.Init(config.Clients, Context.dhcpServer, &Context.autoHosts)
 	config.Clients = nil
 
 	if (runtime.GOOS == "linux" || runtime.GOOS == "darwin") &&
@@ -210,6 +229,9 @@ func run(args options) {
 	if args.bindPort != 0 {
 		config.BindPort = args.bindPort
 	}
+	if len(args.pidFile) != 0 && writePIDFile(args.pidFile) {
+		Context.pidFileName = args.pidFile
+	}
 
 	if !Context.firstRun {
 		// Save the updated config
@@ -217,11 +239,43 @@ func run(args options) {
 		if err != nil {
 			log.Fatal(err)
 		}
+	}
 
-		err = initDNSServer()
+	err := os.MkdirAll(Context.getDataDir(), 0755)
+	if err != nil {
+		log.Fatalf("Cannot create DNS data dir at %s: %s", Context.getDataDir(), err)
+	}
+
+	sessFilename := filepath.Join(Context.getDataDir(), "sessions.db")
+	Context.auth = InitAuth(sessFilename, config.Users, config.WebSessionTTLHours*60*60)
+	if Context.auth == nil {
+		log.Fatalf("Couldn't initialize Auth module")
+	}
+	config.Users = nil
+
+	Context.tls = tlsCreate(config.TLS)
+	if Context.tls == nil {
+		log.Fatalf("Can't initialize TLS module")
+	}
+
+	webConf := WebConfig{
+		firstRun: Context.firstRun,
+		BindHost: config.BindHost,
+		BindPort: config.BindPort,
+	}
+	Context.web = CreateWeb(&webConf)
+	if Context.web == nil {
+		log.Fatalf("Can't initialize Web module")
+	}
+
+	if !Context.firstRun {
+		err := initDNSServer()
 		if err != nil {
 			log.Fatalf("%s", err)
 		}
+		Context.tls.Start()
+		Context.autoHosts.Start()
+
 		go func() {
 			err := startDNSServer()
 			if err != nil {
@@ -235,100 +289,27 @@ func run(args options) {
 		}
 	}
 
-	if len(args.pidFile) != 0 && writePIDFile(args.pidFile) {
-		Context.pidFileName = args.pidFile
-	}
-
-	// Initialize and run the admin Web interface
-	box := packr.NewBox("../build/static")
-
-	// if not configured, redirect / to /install.html, otherwise redirect /install.html to /
-	http.Handle("/", postInstallHandler(optionalAuthHandler(gziphandler.GzipHandler(http.FileServer(box)))))
-	registerControlHandlers()
-
-	// add handlers for /install paths, we only need them when we're not configured yet
-	if Context.firstRun {
-		log.Info("This is the first launch of AdGuard Home, redirecting everything to /install.html ")
-		http.Handle("/install.html", preInstallHandler(http.FileServer(box)))
-		registerInstallHandlers()
-	}
-
-	Context.httpsServer.cond = sync.NewCond(&Context.httpsServer.Mutex)
-
-	// for https, we have a separate goroutine loop
-	go httpServerLoop()
-
-	// this loop is used as an ability to change listening host and/or port
-	for !Context.httpsServer.shutdown {
-		printHTTPAddresses("http")
-
-		// we need to have new instance, because after Shutdown() the Server is not usable
-		address := net.JoinHostPort(config.BindHost, strconv.Itoa(config.BindPort))
-		Context.httpServer = &http.Server{
-			Addr: address,
-		}
-		err := Context.httpServer.ListenAndServe()
-		if err != http.ErrServerClosed {
-			cleanupAlways()
-			log.Fatal(err)
-		}
-		// We use ErrServerClosed as a sign that we need to rebind on new address, so go back to the start of the loop
-	}
+	Context.web.Start()
 
 	// wait indefinitely for other go-routines to complete their job
 	select {}
 }
 
-func httpServerLoop() {
-	for !Context.httpsServer.shutdown {
-		Context.httpsServer.cond.L.Lock()
-		// this mechanism doesn't let us through until all conditions are met
-		for config.TLS.Enabled == false ||
-			config.TLS.PortHTTPS == 0 ||
-			len(config.TLS.PrivateKeyData) == 0 ||
-			len(config.TLS.CertificateChainData) == 0 { // sleep until necessary data is supplied
-			Context.httpsServer.cond.Wait()
-		}
-		address := net.JoinHostPort(config.BindHost, strconv.Itoa(config.TLS.PortHTTPS))
-		// validate current TLS config and update warnings (it could have been loaded from file)
-		data := validateCertificates(string(config.TLS.CertificateChainData), string(config.TLS.PrivateKeyData), config.TLS.ServerName)
-		if !data.ValidPair {
-			cleanupAlways()
-			log.Fatal(data.WarningValidation)
-		}
-		config.Lock()
-		config.TLS.tlsConfigStatus = data // update warnings
-		config.Unlock()
-
-		// prepare certs for HTTPS server
-		// important -- they have to be copies, otherwise changing the contents in config.TLS will break encryption for in-flight requests
-		certchain := make([]byte, len(config.TLS.CertificateChainData))
-		copy(certchain, config.TLS.CertificateChainData)
-		privatekey := make([]byte, len(config.TLS.PrivateKeyData))
-		copy(privatekey, config.TLS.PrivateKeyData)
-		cert, err := tls.X509KeyPair(certchain, privatekey)
-		if err != nil {
-			cleanupAlways()
-			log.Fatal(err)
-		}
-		Context.httpsServer.cond.L.Unlock()
-
-		// prepare HTTPS server
-		Context.httpsServer.server = &http.Server{
-			Addr: address,
-			TLSConfig: &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS12,
-			},
-		}
-
-		printHTTPAddresses("https")
-		err = Context.httpsServer.server.ListenAndServeTLS("", "")
-		if err != http.ErrServerClosed {
-			cleanupAlways()
-			log.Fatal(err)
-		}
+// StartMods - initialize and start DNS after installation
+func StartMods() error {
+	err := initDNSServer()
+	if err != nil {
+		return err
 	}
+
+	Context.tls.Start()
+
+	err = startDNSServer()
+	if err != nil {
+		closeDNSServer()
+		return err
+	}
+	return nil
 }
 
 // Check if the current user has root (administrator) rights
@@ -440,6 +421,15 @@ func configureLogger(args options) {
 func cleanup() {
 	log.Info("Stopping AdGuard Home")
 
+	if Context.web != nil {
+		Context.web.Close()
+		Context.web = nil
+	}
+	if Context.auth != nil {
+		Context.auth.Close()
+		Context.auth = nil
+	}
+
 	err := stopDNSServer()
 	if err != nil {
 		log.Error("Couldn't stop DNS server: %s", err)
@@ -448,17 +438,13 @@ func cleanup() {
 	if err != nil {
 		log.Error("Couldn't stop DHCP server: %s", err)
 	}
-}
 
-// Stop HTTP server, possibly waiting for all active connections to be closed
-func stopHTTPServer() {
-	log.Info("Stopping HTTP server...")
-	Context.httpsServer.shutdown = true
-	if Context.httpsServer.server != nil {
-		_ = Context.httpsServer.server.Shutdown(context.TODO())
+	Context.autoHosts.Close()
+
+	if Context.tls != nil {
+		Context.tls.Close()
+		Context.tls = nil
 	}
-	_ = Context.httpServer.Shutdown(context.TODO())
-	log.Info("Stopped HTTP server")
 }
 
 // This function is called before application exits
@@ -510,7 +496,7 @@ func loadOptions() options {
 			}
 			o.bindPort = v
 		}, nil},
-		{"service", "s", "Service control action: status, install, uninstall, start, stop, restart", func(value string) {
+		{"service", "s", "Service control action: status, install, uninstall, start, stop, restart, reload (configuration)", func(value string) {
 			o.serviceControlAction = value
 		}, nil},
 		{"logfile", "l", "Path to log file. If empty: write to stdout; if 'syslog': write to system log", func(value string) {
@@ -579,11 +565,13 @@ func loadOptions() options {
 func printHTTPAddresses(proto string) {
 	var address string
 
-	if proto == "https" && config.TLS.ServerName != "" {
-		if config.TLS.PortHTTPS == 443 {
-			log.Printf("Go to https://%s", config.TLS.ServerName)
+	tlsConf := tlsConfigSettings{}
+	Context.tls.WriteDiskConfig(&tlsConf)
+	if proto == "https" && tlsConf.ServerName != "" {
+		if tlsConf.PortHTTPS == 443 {
+			log.Printf("Go to https://%s", tlsConf.ServerName)
 		} else {
-			log.Printf("Go to https://%s:%d", config.TLS.ServerName, config.TLS.PortHTTPS)
+			log.Printf("Go to https://%s:%d", tlsConf.ServerName, tlsConf.PortHTTPS)
 		}
 	} else if config.BindHost == "0.0.0.0" {
 		log.Println("AdGuard Home is available on the following addresses:")
@@ -660,4 +648,11 @@ func customDialContext(ctx context.Context, network, addr string) (net.Conn, err
 		return con, err
 	}
 	return nil, errorx.DecorateMany(fmt.Sprintf("couldn't dial to %s", addr), dialErrs...)
+}
+
+func getHTTPProxy(req *http.Request) (*url.URL, error) {
+	if len(config.ProxyURL) == 0 {
+		return nil, nil
+	}
+	return url.Parse(config.ProxyURL)
 }

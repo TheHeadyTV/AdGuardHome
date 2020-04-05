@@ -28,7 +28,7 @@ dns:
   statistics_interval: 90
   querylog_enabled: true
   querylog_interval: 90
-  querylog_memsize: 0
+  querylog_size_memory: 0
   protection_enabled: true
   blocking_mode: null_ip
   blocked_response_ttl: 0
@@ -112,6 +112,7 @@ func TestHome(t *testing.T) {
 
 	dir := prepareTestDir()
 	defer func() { _ = os.RemoveAll(dir) }()
+	_ = os.MkdirAll(filepath.Join(Context.getDataDir(), filterDir), 0755)
 	fn := filepath.Join(dir, "AdGuardHome.yaml")
 
 	assert.True(t, ioutil.WriteFile(fn, []byte(yamlConf), 0644) == nil)

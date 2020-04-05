@@ -1,10 +1,9 @@
-package home
+package dnsfilter
 
 import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/AdguardTeam/AdGuardHome/dnsfilter"
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/AdguardTeam/urlfilter/rules"
 )
@@ -21,20 +20,36 @@ type svc struct {
 // client/src/components/ui/Icons.js
 var serviceRulesArray = []svc{
 	{"whatsapp", []string{"||whatsapp.net^", "||whatsapp.com^"}},
-	{"facebook", []string{"||facebook.com^", "||facebook.net^", "||fbcdn.net^", "||fb.me^", "||fb.com^", "||fbsbx.com^"}},
+	{"facebook", []string{
+		"||facebook.com^",
+		"||facebook.net^",
+		"||fbcdn.net^",
+		"||fb.me^",
+		"||fb.com^",
+		"||fbsbx.com^",
+		"||messenger.com^",
+		"||facebookcorewwwi.onion^",
+		"||fbcdn.com^",
+	}},
 	{"twitter", []string{"||twitter.com^", "||t.co^", "||twimg.com^"}},
-	{"youtube", []string{"||youtube.com^", "||ytimg.com^", "||youtu.be^", "||googlevideo.com^", "||youtubei.googleapis.com^"}},
-	{"messenger", []string{"||fb.com^", "||facebook.com^", "||messenger.com^"}},
+	{"youtube", []string{
+		"||youtube.com^",
+		"||ytimg.com^",
+		"||youtu.be^",
+		"||googlevideo.com^",
+		"||youtubei.googleapis.com^",
+		"||youtube-nocookie.com^",
+	}},
 	{"twitch", []string{"||twitch.tv^", "||ttvnw.net^"}},
 	{"netflix", []string{"||nflxext.com^", "||netflix.com^"}},
 	{"instagram", []string{"||instagram.com^", "||cdninstagram.com^"}},
 	{"snapchat", []string{"||snapchat.com^", "||sc-cdn.net^", "||impala-media-production.s3.amazonaws.com^"}},
-	{"discord", []string{"||discord.gg^", "||discordapp.net^", "||discordapp.com^"}},
+	{"discord", []string{"||discord.gg^", "||discordapp.net^", "||discordapp.com^", "||discord.media^"}},
 	{"ok", []string{"||ok.ru^"}},
 	{"skype", []string{"||skype.com^"}},
 	{"vk", []string{"||vk.com^"}},
 	{"origin", []string{"||origin.com^", "||signin.ea.com^", "||accounts.ea.com^"}},
-	{"steam", []string{"||steam.com^"}},
+	{"steam", []string{"||steam.com^", "||steampowered.com^"}},
 	{"epic_games", []string{"||epicgames.com^"}},
 	{"reddit", []string{"||reddit.com^", "||redditstatic.com^", "||redditmedia.com^", "||redd.it^"}},
 	{"mail_ru", []string{"||mail.ru^"}},
@@ -51,6 +66,8 @@ var serviceRulesArray = []svc{
 		"||cloudflare.cn^",
 		"||one.one^",
 		"||warp.plus^",
+		"||1.1.1.1^",
+		"||dns4torpnlfs2ifuz2s2yf3fc7rdmsbhm6rw75euj35pac6ap25zgqad.onion^",
 	}},
 	{"amazon", []string{
 		"||amazon.com^",
@@ -116,11 +133,12 @@ var serviceRulesArray = []svc{
 		"||ixigua.com^",
 		"||muscdn.com^",
 		"||bytedance.map.fastly.net^",
+		"||douyin.com^",
 	}},
 }
 
 // convert array to map
-func initServices() {
+func initBlockedServices() {
 	serviceRules = make(map[string][]*rules.NetworkRule)
 	for _, s := range serviceRulesArray {
 		netRules := []*rules.NetworkRule{}
@@ -136,9 +154,20 @@ func initServices() {
 	}
 }
 
+// BlockedSvcKnown - return TRUE if a blocked service name is known
+func BlockedSvcKnown(s string) bool {
+	_, ok := serviceRules[s]
+	return ok
+}
+
 // ApplyBlockedServices - set blocked services settings for this DNS request
-func ApplyBlockedServices(setts *dnsfilter.RequestFilteringSettings, list []string) {
-	setts.ServicesRules = []dnsfilter.ServiceEntry{}
+func (d *Dnsfilter) ApplyBlockedServices(setts *RequestFilteringSettings, list []string, global bool) {
+	setts.ServicesRules = []ServiceEntry{}
+	if global {
+		d.confLock.RLock()
+		defer d.confLock.RUnlock()
+		list = d.Config.BlockedServices
+	}
 	for _, name := range list {
 		rules, ok := serviceRules[name]
 
@@ -147,51 +176,45 @@ func ApplyBlockedServices(setts *dnsfilter.RequestFilteringSettings, list []stri
 			continue
 		}
 
-		s := dnsfilter.ServiceEntry{}
+		s := ServiceEntry{}
 		s.Name = name
 		s.Rules = rules
 		setts.ServicesRules = append(setts.ServicesRules, s)
 	}
 }
 
-func handleBlockedServicesList(w http.ResponseWriter, r *http.Request) {
-	config.RLock()
-	list := config.DNS.BlockedServices
-	config.RUnlock()
+func (d *Dnsfilter) handleBlockedServicesList(w http.ResponseWriter, r *http.Request) {
+	d.confLock.RLock()
+	list := d.Config.BlockedServices
+	d.confLock.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	err := json.NewEncoder(w).Encode(list)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "json.Encode: %s", err)
+		httpError(r, w, http.StatusInternalServerError, "json.Encode: %s", err)
 		return
 	}
 }
 
-func handleBlockedServicesSet(w http.ResponseWriter, r *http.Request) {
+func (d *Dnsfilter) handleBlockedServicesSet(w http.ResponseWriter, r *http.Request) {
 	list := []string{}
 	err := json.NewDecoder(r.Body).Decode(&list)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "json.Decode: %s", err)
+		httpError(r, w, http.StatusBadRequest, "json.Decode: %s", err)
 		return
 	}
 
-	config.Lock()
-	config.DNS.BlockedServices = list
-	config.Unlock()
+	d.confLock.Lock()
+	d.Config.BlockedServices = list
+	d.confLock.Unlock()
 
 	log.Debug("Updated blocked services list: %d", len(list))
 
-	err = writeAllConfigsAndReloadDNS()
-	if err != nil {
-		httpError(w, http.StatusBadRequest, "%s", err)
-		return
-	}
-
-	httpOK(r, w)
+	d.ConfigModified()
 }
 
-// RegisterBlockedServicesHandlers - register HTTP handlers
-func RegisterBlockedServicesHandlers() {
-	httpRegister(http.MethodGet, "/control/blocked_services/list", handleBlockedServicesList)
-	httpRegister(http.MethodPost, "/control/blocked_services/set", handleBlockedServicesSet)
+// registerBlockedServicesHandlers - register HTTP handlers
+func (d *Dnsfilter) registerBlockedServicesHandlers() {
+	d.Config.HTTPRegister("GET", "/control/blocked_services/list", d.handleBlockedServicesList)
+	d.Config.HTTPRegister("POST", "/control/blocked_services/set", d.handleBlockedServicesSet)
 }

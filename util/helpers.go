@@ -2,16 +2,13 @@ package util
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
 	"runtime"
 	"strings"
 )
-
-// ---------------------
-// general helpers
-// ---------------------
 
 // fileExists returns TRUE if file exists
 func FileExists(fn string) bool {
@@ -33,9 +30,6 @@ func RunCommand(command string, arguments ...string) (int, string, error) {
 	return cmd.ProcessState.ExitCode(), string(out), nil
 }
 
-// ---------------------
-// debug logging helpers
-// ---------------------
 func FuncName() string {
 	pc := make([]uintptr, 10) // at least 1 entry needed
 	runtime.Callers(2, pc)
@@ -44,6 +38,7 @@ func FuncName() string {
 }
 
 // SplitNext - split string by a byte and return the first chunk
+// Skip empty chunks
 // Whitespace is trimmed
 func SplitNext(str *string, splitBy byte) string {
 	i := strings.IndexByte(*str, splitBy)
@@ -51,9 +46,39 @@ func SplitNext(str *string, splitBy byte) string {
 	if i != -1 {
 		s = (*str)[0:i]
 		*str = (*str)[i+1:]
+		k := 0
+		ch := rune(0)
+		for k, ch = range *str {
+			if byte(ch) != splitBy {
+				break
+			}
+		}
+		*str = (*str)[k:]
 	} else {
 		s = *str
 		*str = ""
 	}
 	return strings.TrimSpace(s)
+}
+
+// MinInt - return the minimum value
+func MinInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// IsOpenWrt checks if OS is OpenWRT
+func IsOpenWrt() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+
+	body, err := ioutil.ReadFile("/etc/os-release")
+	if err != nil {
+		return false
+	}
+
+	return strings.Contains(string(body), "OpenWrt")
 }

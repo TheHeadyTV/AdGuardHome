@@ -3,9 +3,7 @@ package home
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"net"
-	"os"
 	"os/exec"
 	"runtime"
 	"sort"
@@ -14,7 +12,9 @@ import (
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/dhcpd"
+	"github.com/AdguardTeam/AdGuardHome/dnsfilter"
 	"github.com/AdguardTeam/AdGuardHome/dnsforward"
+	"github.com/AdguardTeam/AdGuardHome/util"
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/AdguardTeam/golibs/utils"
@@ -23,6 +23,8 @@ import (
 const (
 	clientsUpdatePeriod = 1 * time.Hour
 )
+
+var webHandlersRegistered = false
 
 // Client information
 type Client struct {
@@ -76,12 +78,14 @@ type clientsContainer struct {
 	// dhcpServer is used for looking up clients IP addresses by MAC addresses
 	dhcpServer *dhcpd.Server
 
+	autoHosts *util.AutoHosts // get entries from system hosts-files
+
 	testing bool // if TRUE, this object is used for internal tests
 }
 
 // Init initializes clients container
 // Note: this function must be called only once
-func (clients *clientsContainer) Init(objects []clientObject, dhcpServer *dhcpd.Server) {
+func (clients *clientsContainer) Init(objects []clientObject, dhcpServer *dhcpd.Server, autoHosts *util.AutoHosts) {
 	if clients.list != nil {
 		log.Fatal("clients.list != nil")
 	}
@@ -95,16 +99,31 @@ func (clients *clientsContainer) Init(objects []clientObject, dhcpServer *dhcpd.
 	}
 
 	clients.dhcpServer = dhcpServer
+	clients.autoHosts = autoHosts
 	clients.addFromConfig(objects)
 
 	if !clients.testing {
-		go clients.periodicUpdate()
-
 		clients.addFromDHCP()
 		clients.dhcpServer.SetOnLeaseChanged(clients.onDHCPLeaseChanged)
-
-		clients.registerWebHandlers()
+		clients.autoHosts.SetOnChanged(clients.onHostsChanged)
 	}
+}
+
+// Start - start the module
+func (clients *clientsContainer) Start() {
+	if !clients.testing {
+		if !webHandlersRegistered {
+			webHandlersRegistered = true
+			clients.registerWebHandlers()
+		}
+		go clients.periodicUpdate()
+	}
+
+}
+
+// Reload - reload auto-clients
+func (clients *clientsContainer) Reload() {
+	clients.addFromSystemARP()
 }
 
 type clientObject struct {
@@ -140,9 +159,16 @@ func (clients *clientsContainer) addFromConfig(objects []clientObject) {
 			SafeBrowsingEnabled: cy.SafeBrowsingEnabled,
 
 			UseOwnBlockedServices: !cy.UseGlobalBlockedServices,
-			BlockedServices:       cy.BlockedServices,
 
 			Upstreams: cy.Upstreams,
+		}
+
+		for _, s := range cy.BlockedServices {
+			if !dnsfilter.BlockedSvcKnown(s) {
+				log.Debug("Clients: skipping unknown blocked-service '%s'", s)
+				continue
+			}
+			cli.BlockedServices = append(cli.BlockedServices, s)
 		}
 
 		for _, t := range cy.Tags {
@@ -187,8 +213,7 @@ func (clients *clientsContainer) WriteDiskConfig(objects *[]clientObject) {
 
 func (clients *clientsContainer) periodicUpdate() {
 	for {
-		clients.addFromHostsFile()
-		clients.addFromSystemARP()
+		clients.Reload()
 		time.Sleep(clientsUpdatePeriod)
 	}
 }
@@ -200,6 +225,10 @@ func (clients *clientsContainer) onDHCPLeaseChanged(flags int) {
 		dhcpd.LeaseChangedRemovedStatic:
 		clients.addFromDHCP()
 	}
+}
+
+func (clients *clientsContainer) onHostsChanged() {
+	clients.addFromHostsFile()
 }
 
 // Exists checks if client with this IP already exists
@@ -582,46 +611,28 @@ func (clients *clientsContainer) rmHosts(source clientSource) int {
 	return n
 }
 
-// Parse system 'hosts' file and fill clients array
+// Fill clients array from system hosts-file
 func (clients *clientsContainer) addFromHostsFile() {
-	hostsFn := "/etc/hosts"
-	if runtime.GOOS == "windows" {
-		hostsFn = os.ExpandEnv("$SystemRoot\\system32\\drivers\\etc\\hosts")
-	}
-
-	d, e := ioutil.ReadFile(hostsFn)
-	if e != nil {
-		log.Info("Can't read file %s: %v", hostsFn, e)
-		return
-	}
+	hosts := clients.autoHosts.List()
 
 	clients.lock.Lock()
 	defer clients.lock.Unlock()
 	_ = clients.rmHosts(ClientSourceHostsFile)
 
-	lines := strings.Split(string(d), "\n")
 	n := 0
-	for _, ln := range lines {
-		ln = strings.TrimSpace(ln)
-		if len(ln) == 0 || ln[0] == '#' {
-			continue
-		}
-
-		fields := strings.Fields(ln)
-		if len(fields) < 2 {
-			continue
-		}
-
-		ok, e := clients.addHost(fields[0], fields[1], ClientSourceHostsFile)
-		if e != nil {
-			log.Tracef("%s", e)
-		}
-		if ok {
-			n++
+	for ip, names := range hosts {
+		for _, name := range names {
+			ok, err := clients.addHost(ip, name.String(), ClientSourceHostsFile)
+			if err != nil {
+				log.Debug("Clients: %s", err)
+			}
+			if ok {
+				n++
+			}
 		}
 	}
 
-	log.Debug("Clients: added %d client aliases from %s", n, hostsFn)
+	log.Debug("Clients: added %d client aliases from system hosts-file", n)
 }
 
 // Add IP -> Host pairs from the system's `arp -a` command output
