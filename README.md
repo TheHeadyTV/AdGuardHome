@@ -47,6 +47,7 @@ Follow any of the below method and then deploy the binary
 
 * #### Method: Applying the patch
 
+<<<<<<< HEAD
     ```
     wget https://raw.githubusercontent.com/iganeshk/AdGuardHome/dev-assets/dark-mustard-theme.patch
     git checkout master/your-branch
@@ -54,6 +55,10 @@ Follow any of the below method and then deploy the binary
     # comment out target builds which aren't required in the release.sh script
     ./release.sh
     ```
+=======
+ * [go](https://golang.org/dl/) v1.14 or later.
+ * [node.js](https://nodejs.org/en/download/) v10 or later.
+>>>>>>> upstream/master
 
 * #### Method: Downloading the latest release
 

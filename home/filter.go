@@ -24,12 +24,6 @@ var (
 	nextFilterID = time.Now().Unix() // semi-stable way to generate an unique ID
 )
 
-// type FilteringConf struct {
-// 	BlockLists []filter
-// 	AllowLists []filter
-// 	UserRules []string
-// }
-
 // Filtering - module object
 type Filtering struct {
 	// conf FilteringConf
@@ -290,7 +284,7 @@ func (f *Filtering) periodicallyRefreshFilters() {
 func (f *Filtering) refreshFilters(flags int, important bool) (int, error) {
 	set := atomic.CompareAndSwapUint32(&f.refreshStatus, 0, 1)
 	if !important && !set {
-		return 0, fmt.Errorf("Filters update procedure is already running")
+		return 0, fmt.Errorf("filters update procedure is already running")
 	}
 
 	f.refreshLock.Lock()
@@ -447,8 +441,9 @@ func (f *Filtering) refreshFiltersIfNecessary(flags int) (int, bool) {
 }
 
 // Allows printable UTF-8 text with CR, LF, TAB characters
-func isPrintableText(data []byte) bool {
-	for _, c := range data {
+func isPrintableText(data []byte, len int) bool {
+	for i := 0; i < len; i++ {
+		c := data[i]
 		if (c >= ' ' && c != 0x7f) || c == '\n' || c == '\r' || c == '\t' {
 			continue
 		}
@@ -508,14 +503,14 @@ func (f *Filtering) update(filter *filter) (bool, error) {
 func (f *Filtering) updateIntl(filter *filter) (bool, error) {
 	log.Tracef("Downloading update for filter %d from %s", filter.ID, filter.URL)
 
-	tmpfile, err := ioutil.TempFile(filepath.Join(Context.getDataDir(), filterDir), "")
+	tmpFile, err := ioutil.TempFile(filepath.Join(Context.getDataDir(), filterDir), "")
 	if err != nil {
 		return false, err
 	}
 	defer func() {
-		if tmpfile != nil {
-			_ = tmpfile.Close()
-			_ = os.Remove(tmpfile.Name())
+		if tmpFile != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
 		}
 	}()
 
@@ -549,14 +544,14 @@ func (f *Filtering) updateIntl(filter *filter) (bool, error) {
 			firstChunkLen += copied
 
 			if firstChunkLen == len(firstChunk) || err == io.EOF {
-				if !isPrintableText(firstChunk) {
-					return false, fmt.Errorf("Data contains non-printable characters")
+				if !isPrintableText(firstChunk, firstChunkLen) {
+					return false, fmt.Errorf("data contains non-printable characters")
 				}
 
 				s := strings.ToLower(string(firstChunk))
 				if strings.Index(s, "<html") >= 0 ||
 					strings.Index(s, "<!doctype") >= 0 {
-					return false, fmt.Errorf("Data is HTML, not plain text")
+					return false, fmt.Errorf("data is HTML, not plain text")
 				}
 
 				htmlTest = false
@@ -564,7 +559,7 @@ func (f *Filtering) updateIntl(filter *filter) (bool, error) {
 			}
 		}
 
-		_, err2 := tmpfile.Write(buf[:n])
+		_, err2 := tmpFile.Write(buf[:n])
 		if err2 != nil {
 			return false, err2
 		}
@@ -579,8 +574,8 @@ func (f *Filtering) updateIntl(filter *filter) (bool, error) {
 	}
 
 	// Extract filter name and count number of rules
-	_, _ = tmpfile.Seek(0, io.SeekStart)
-	rulesCount, checksum, filterName := f.parseFilterContents(tmpfile)
+	_, _ = tmpFile.Seek(0, io.SeekStart)
+	rulesCount, checksum, filterName := f.parseFilterContents(tmpFile)
 	// Check if the filter has been really changed
 	if filter.checksum == checksum {
 		log.Tracef("Filter #%d at URL %s hasn't changed, not updating it", filter.ID, filter.URL)
@@ -596,12 +591,14 @@ func (f *Filtering) updateIntl(filter *filter) (bool, error) {
 	filter.checksum = checksum
 	filterFilePath := filter.Path()
 	log.Printf("Saving filter %d contents to: %s", filter.ID, filterFilePath)
-	err = os.Rename(tmpfile.Name(), filterFilePath)
+
+	// Closing the file before renaming it is necessary on Windows
+	_ = tmpFile.Close()
+	err = os.Rename(tmpFile.Name(), filterFilePath)
 	if err != nil {
 		return false, err
 	}
-	tmpfile.Close()
-	tmpfile = nil
+	tmpFile = nil
 
 	return true, nil
 }
